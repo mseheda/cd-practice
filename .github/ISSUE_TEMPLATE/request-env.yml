@@ -1,0 +1,26 @@
+---
+name: Request a Deployment Environment
+title: "Deployment Environment Request"
+description: Request a deployment environment for the last step of the actions workshop
+labels:
+  - deployment-env
+assignees:
+  - davelosert
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Request a Deployment Environment
+
+        By opening an issue and posting your repository, we will create a deployment environment for you to use in the last step of the actions workshop.
+
+        The environment will be an Azure Web App Container, and you will get a service principal with OIDC Access to deploy to it. The required clientId of the service principal will be added as a action variable to your repository.
+
+  - type: input
+    attributes:
+      label: ">>>repository<<<"
+      description: The name of the owner/repository you'd like to request an environment for. It must exist already. You can get it by copying the Path section of your repositoryg (so for `github.com/davelosert/test`, it would be `davelosert/test`). The repository must exist already.
+      placeholder: owner/respoitory
+    validations:
+      required: true

@@ -1,0 +1,124 @@
+name: Handle Environment Request
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  validate:
+    name: Validate Inputs
+    permissions:
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract Form Template Data
+        id: issue_payload
+        uses: peter-murray/issue-forms-body-parser@v3
+        with:
+          separator: "###"
+          issue_id: ${{ github.event.issue.number }}
+          label_marker_start: ">>>"
+          label_marker_end: "<<<"
+
+      - name: Validate Inputs
+        id: validate
+        uses: actions/github-script@v6
+        env:
+          PARSED_PAYLOAD: ${{ steps.issue_payload.outputs.payload }}
+        with:
+          github-token: ${{ secrets.ORGANIZATION_TOKEN }}
+          script: |
+            core.info(`Parsing payload: ${process.env.PARSED_PAYLOAD}`);
+            const { repository } = JSON.parse(process.env.PARSED_PAYLOAD);
+            const [ targetOwner, targetRepo ] = repository.split('/');
+
+            if(!targetRepo) {
+              core.setOutput('error', `Missing owner in Input format. Please make sure to specificy your repository as 'owner/repo'.`);
+              core.setFailed(`Wrong input format.`)
+              return;
+            }
+
+            core.info(`Checking repository existence of ${targetOwner}/${targetRepo}...`);
+            try {
+              await github.rest.repos.get({
+                owner: targetOwner,
+                repo: targetRepo
+              });
+            } catch (e) {
+              if(e.status === 404) {
+                core.setOutput('error', `Repository ${targetOwner}/${targetRepo} not found. Please make sure you've input an existin repo`);
+                core.setFailed(`Repository ${targetOwner}/${targetRepo} not found`)
+              } else {
+                core.setOutput('error', `Unknown Error occured, please check the actions logs for details or contact your trainer.`);
+                core.setFailed(`Unknown Error: ${e}`);
+              }
+              return;
+            }
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "create-deploy-env.yml",
+              ref: 'main',
+              inputs: {
+                repository: targetRepo,
+                owner: targetOwner,
+                user: context.payload.issue.user.login,
+                tracking_issue: `${context.payload.issue.number}`,
+              },
+            });
+
+            core.setOutput('error', '');
+    outputs:
+      error: ${{ steps.validate.outputs.error }}
+
+  update_issue:
+    name: Update request issue
+    if: always()
+
+    # Ignore failures on this as the demo creation has already been invoked
+    continue-on-error: true
+
+    runs-on: ubuntu-22.04
+
+    needs:
+      - validate
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Find Comment
+        uses: peter-evans/find-comment@v2
+        id: fc
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body-includes: "<!-- issue-comment-marker -->"
+      - name: Provide success issue comment
+        if: ${{ needs.validate.result == 'success' }}
+        uses: peter-evans/create-or-update-comment@v2
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.issue.number }}
+          edit-mode: replace
+          body: |
+            <!-- issue-comment-marker -->
+            ## Environment creation status
+
+            🕐 Environment creation in progress...
+
+      - name: Provide failure/cancelled issue comment
+        if: ${{ needs.validate.result != 'success' }}
+        uses: peter-evans/create-or-update-comment@v2
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.issue.number }}
+          edit-mode: replace
+          body: |
+            <!-- issue-comment-marker -->
+            ## Environment creation status
+            :exclamation: Environment request creation failed :boom:
+
+            We've received the following error:
+            ${{ needs.validate.outputs.error }}

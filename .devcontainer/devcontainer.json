@@ -1,0 +1,27 @@
+
+{
+  "dockerComposeFile": [
+    "docker-compose.yml"
+  ],
+  "service": "dev",
+  "forwardPorts": [],
+  "portsAttributes": {},
+  "extensions": [
+    "ms-azuretools.vscode-bicep",
+    "GitHub.vscode-github-actions"
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "settings": {
+    "terminal.integrated.profiles.linux": {
+      "bash": {
+        "path": "bash",
+        "icon": "terminal-bash"
+      }
+    },
+    "telemetry.enableTelemetry": false,
+    "extensions.ignoreRecommendations": true,
+  }
+}

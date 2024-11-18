@@ -1,0 +1,216 @@
+name: Creation Deployment Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      user:
+        description: "User that requested the environment"
+        required: true
+      owner:
+        description: "The user or organization the repository belongs to"
+        required: true
+      repository:
+        description: "The repository name (without owner)"
+        required: true
+      tracking_issue:
+        description: "The issue number that tracks this deployment"
+        required: true
+
+env:
+  AZ_REGION: westeurope
+  OWNER_REPO_NORMALIZED: ${{ inputs.owner }}-${{ inputs.repository }}
+  AZ_RESOURCE_GROUP: aw-${{ inputs.owner }}-${{ inputs.repository }}-rg
+  AZ_ROLE: "GitHub Actions Workshop Participants Role"
+
+jobs:
+  deploy:
+    name: Deploy Azure Environment
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    outputs:
+      appId: ${{ steps.create-app.outputs.appId }}
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZ_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+      - name: Create AAD App Registration and Service Principal
+        id: create-app
+        uses: azure/cli@v1
+        with:
+          azcliversion: 2.50.0
+          inlineScript: |
+            echo "Creating AAD App ${{ env.OWNER_REPO_NORMALIZED }}"
+            app=$(az ad app create --display-name "aw-${{ env.OWNER_REPO_NORMALIZED }}" --sign-in-audience "AzureADMyOrg")
+            APP_ID=$(echo $app | jq -r '.appId')
+
+            SP=$(az ad sp list --filter "appId eq '${APP_ID}'")
+            if [ "${SP}" == "[]" ]; then
+              echo "Adding Servie Principal to App..."
+              SP=$(az ad sp create --id ${APP_ID}) 
+              SP_ID=$(echo ${SP} | jq -r '.id')
+            else
+              echo "Service Principal already exists. Skipping..."
+              SP_ID=$(echo ${SP} | jq -r '.[0].id')
+            fi
+
+            echo "Found APP_ID: [${APP_ID}] and SP_ID: [${SP_ID}]"
+
+            echo "appId=${APP_ID}" >> $GITHUB_OUTPUT
+            echo "spId=${SP_ID}" >> $GITHUB_OUTPUT
+
+      - name: Create Federated Credentials (OIDC)
+        id: create-creds
+        uses: azure/cli@v1
+        with:
+          azcliversion: 2.50.0
+          ## Check if federated credentials by that name already exists and create it if not
+          inlineScript: |
+            EXISTING_FC=$(az ad app federated-credential list --id ${{ steps.create-app.outputs.appId }} --query "[?name=='staging-deployment']")
+            if [ "$EXISTING_FC" == "[]" ]; then
+              az ad app federated-credential create --id ${{ steps.create-app.outputs.appId }} --parameters "{
+                  \"name\": \"staging-deployment\",
+                  \"issuer\": \"https://token.actions.githubusercontent.com\",
+                  \"subject\": \"repo:${{ inputs.owner }}/${{ inputs.repository }}:environment:staging\", 
+                  \"description\": \"These credentials allow deployment from the specified repository in the Staging Environmnent\",
+                  \"audiences\": [
+                      \"api://AzureADTokenExchange\"
+                  ]
+                }"
+            else
+              echo "Federated credential already exists. Skipping..."
+            fi
+
+      - name: Create Resource Group
+        id: create-rg
+        uses: azure/cli@v1
+        with:
+          inlineScript: |
+            if [ "$(az group exists --name ${{ env.AZ_RESOURCE_GROUP }})" == 'false' ]; then
+              az group create --name ${{ env.AZ_RESOURCE_GROUP }} --location ${{ env.AZ_REGION }} --tags actor=${{ inputs.user }} purpose='GitHub Actions Workshop' repository='${{ inputs.owner }}/${{ inputs.repository }}'
+            else
+              echo "Resource group ${{ env.AZ_RESOURCE_GROUP }} already exists. Skipping..."
+            fi
+
+      - name: Assign Web App Deployment Role
+        uses: azure/cli@v1
+        with:
+          azcliversion: 2.50.0
+          inlineScript: |
+            az role assignment create --assignee-object-id ${{ steps.create-app.outputs.spId }} --role "${{ env.AZ_ROLE }}" --scope /subscriptions/${{ secrets.AZ_SUBSCRIPTION_ID }}/resourceGroups/${{ env.AZ_RESOURCE_GROUP }} --assignee-principal-type ServicePrincipal
+
+  update_repo:
+    name: Update Target Repository
+    needs:
+      - deploy
+    runs-on: ubuntu-22.04
+    steps:
+      ## Generate an action with GitHub/SCripts that will add two action variables to the repository with the resource group and the client id
+      - name: Validate Inputs
+        id: repo-update
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.ORGANIZATION_TOKEN }}
+          script: |
+            function createVariable(name, value) {
+              return github.request('POST /repos/{owner}/{repo}/actions/variables', {
+                repo: "${{ inputs.repository }}",
+                owner: "${{ inputs.owner }}",
+                name,
+                value,
+                headers: {
+                  'X-GitHub-Api-Version': '2022-11-28'
+                }
+              });
+            }
+
+            function updateVariable(name, value) {
+              return github.request('PATCH /repos/{owner}/{repo}/actions/variables/{variable_name}', {
+                repo: "${{ inputs.repository }}",
+                owner: "${{ inputs.owner }}",
+                variable_name: name,
+                name,
+                value,
+                headers: {
+                  'X-GitHub-Api-Version': '2022-11-28'
+                }
+              });
+            }
+
+            const response = await github.request('GET /repos/{owner}/{repo}/actions/variables', {
+              repo: "${{ inputs.repository }}",
+              owner: "${{ inputs.owner }}",
+              headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+
+            const existingVariables = response.data.variables.map(v => v.name);
+            if(!existingVariables.includes('AZ_RESOURCE_GROUP')) {
+              core.info(`Creating variable AZ_RESOURCE_GROUP in ${{ inputs.owner }}/${{ inputs.repository }}.`);
+              createVariable('AZ_RESOURCE_GROUP', "${{ env.AZ_RESOURCE_GROUP }}");
+            } else {
+              core.info(`Variable AZ_RESOURCE_GROUP already exists in ${{ inputs.owner }}/${{ inputs.repository }}. Updating...`);
+              updateVariable('AZ_RESOURCE_GROUP', "${{ env.AZ_RESOURCE_GROUP }}");
+            }
+
+            if(!existingVariables.includes('AZ_CLIENT_ID')) {
+              core.info(`Creating variable AZ_CLIENT_ID in ${{ inputs.owner }}/${{ inputs.repository }}.`)
+              createVariable('AZ_CLIENT_ID', "${{ needs.deploy.outputs.appId }}");
+            } else {
+              core.info(`Variable AZ_CLIENT_ID already exists in ${{ inputs.owner }}/${{ inputs.repository }}. Updating...`);
+              updateVariable('AZ_CLIENT_ID', "${{ needs.deploy.outputs.appId }}");
+            }
+
+  update_issue:
+    name: Update request issue
+    if: always()
+
+    # Ignore failures on this as the demo creation has already been invoked
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    needs:
+      - deploy
+      - update_repo
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Find Comment
+        uses: peter-evans/find-comment@v2
+        id: fc
+        with:
+          issue-number: ${{ inputs.tracking_issue}}
+          body-includes: "<!-- issue-comment-marker -->"
+      - name: Provide success issue comment
+        if: ${{ needs.deploy.result == 'success' }} && ${{ needs.update_repo.result == 'success' }}
+        uses: peter-evans/create-or-update-comment@v2
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ inputs.tracking_issue }}
+          edit-mode: replace
+          body: |
+            <!-- issue-comment-marker -->
+            ## Environment creation status
+
+            ✅ Your environment was setup successfully! 🎉
+
+            You can now use your repository to deploy to the staging environment.
+            The necessary variables `AZ_CLIENT_ID` and `AZ_RESOURCE_GROUP` were added to your repositorie's action-variables.
+
+      - name: Provide failure/cancelled issue comment
+        if: ${{ needs.deploy.result != 'success' || needs.update_repo.result != 'success' }}
+        uses: peter-evans/create-or-update-comment@v2
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ inputs.tracking_issue}}
+          edit-mode: replace
+          body: |
+            <!-- issue-comment-marker -->
+            ## Environment creation status
+            :exclamation: Environment request creation failed :boom:
+
+            Please check the actions logs and contact your trainer.
